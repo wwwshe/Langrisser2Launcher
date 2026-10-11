@@ -6,6 +6,9 @@
 
 > ⚠️ 이 저장소에는 **게임 파일이 포함되어 있지 않아요.** 게임은 직접 소유한 정품에서 준비해 주세요.
 
+<img width="395" height="491" alt="스크린샷 2026-10-12 014846" src="https://github.com/user-attachments/assets/dd6b9a8b-3bc5-49df-9958-67690eeae251" />
+
+
 ---
 
 ## 주요 기능
