@@ -2,7 +2,8 @@
 // .NET Framework 4.x 기본 컴파일러(csc, C# 5)로 빌드됩니다. 빌드 방법은 README 참고.
 // - 소리: 이 게임 볼륨만 조절 (실행 중에도 실시간 반영)
 // - 화면: cnc-ddraw(ddraw.ini [ddraw] 섹션) 주요 설정 편집 (다음 실행부터 적용)
-// - 게임 패치: 게임 시작 직전에 LANGPC2.EXE 버그 수정 바이트 패치를 자동 적용
+// - 게임 패치: 게임 시작 직전에 LANGPC2.EXE 버그 수정 바이트 패치를 자동 적용 (창 제목 글자색, 상태창 깨진 글자)
+// - 게임 글꼴: 게임 글자 글꼴(Arial -> 굴림/돋움/바탕), 굵기, 크기(축소만) 변경
 // - 효과음 균형: 유독 크게 녹음된 효과음(DSF)만 음량을 낮춤 (원본은 DSF_ORIG에 백업)
 using System;
 using System.Collections.Generic;
@@ -89,50 +90,12 @@ namespace Lang2Launcher
     // ================= ddraw.ini [ddraw] 섹션 읽기/쓰기 =================
     static class DdrawIni
     {
-        // 게임(cnc-ddraw)이 종료 직후 ddraw.ini를 쓰는 중이거나 백신이 스캔 중이면 잠깐 잠길 수 있음
-        // → 공유 모드로 열고 짧게 재시도
-        static string[] ReadLinesShared(string path)
-        {
-            for (int attempt = 0; ; attempt++)
-            {
-                try
-                {
-                    using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                    using (var sr = new StreamReader(fs, new UTF8Encoding(false), true))
-                    {
-                        var list = new List<string>();
-                        string line;
-                        while ((line = sr.ReadLine()) != null) list.Add(line);
-                        return list.ToArray();
-                    }
-                }
-                catch (IOException)
-                {
-                    if (attempt >= 4) throw;
-                    System.Threading.Thread.Sleep(50);
-                }
-            }
-        }
-
-        static void WriteLinesRetry(string path, string[] lines)
-        {
-            for (int attempt = 0; ; attempt++)
-            {
-                try { File.WriteAllLines(path, lines, new UTF8Encoding(false)); return; }
-                catch (IOException)
-                {
-                    if (attempt >= 9) throw;
-                    System.Threading.Thread.Sleep(100);
-                }
-            }
-        }
-
         public static Dictionary<string, string> Read(string path)
         {
             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (!File.Exists(path)) return map;
             bool inSec = false;
-            foreach (var raw in ReadLinesShared(path))
+            foreach (var raw in File.ReadAllLines(path))
             {
                 var t = raw.Trim();
                 var m = Regex.Match(t, @"^\[(.+)\]$");
@@ -146,7 +109,7 @@ namespace Lang2Launcher
 
         public static void Write(string path, Dictionary<string, string> values)
         {
-            var lines = File.Exists(path) ? new List<string>(ReadLinesShared(path)) : new List<string> { "[ddraw]" };
+            var lines = File.Exists(path) ? new List<string>(File.ReadAllLines(path)) : new List<string> { "[ddraw]" };
             int secStart = -1, secEnd = lines.Count;
             for (int i = 0; i < lines.Count; i++)
             {
@@ -166,7 +129,7 @@ namespace Lang2Launcher
                 }
                 if (!done) { lines.Insert(secStart + 1, kv.Key + "=" + kv.Value); secEnd++; }
             }
-            WriteLinesRetry(path, lines.ToArray());
+            File.WriteAllLines(path, lines.ToArray());
         }
     }
 
@@ -209,7 +172,29 @@ namespace Lang2Launcher
             "90 90 90 90 90");
 
         // 적용할 패치 / 원본으로 되돌릴 패치
-        static readonly ExePatch[] Apply = { TitleColor };
+        // 상태창 클래스명 뒤에 '후' 같은 깨진 글자가 붙는 문제 수정 - 유닛 이름 테이블(0x4410B8, 244칸)
+        // 상태창(0x402E31)과 0x40E19E가 [유닛+0x37] 번호로 이 테이블에서 이름을 가져오는데,
+        // 이름 없는 유닛용 칸(0, 121, 204~243)이 빈 문자열 대신 .bss의 런타임 변수(0x47ED30)를 가리킴.
+        // 그 변수 값(예: C8 C4)이 그대로 한글로 찍힘 -> 빈 문자열(0x441020, '파이어스' 끝의 NUL)을 가리키게.
+        const long NameTableOffset = 0x3FAB8;   // 파일 오프셋 (VA 0x4410B8)
+        static ExePatch[] EmptyNamePatches()
+        {
+            var slots = new List<int> { 0, 121 };
+            for (int i = 204; i <= 243; i++) slots.Add(i);
+            var list = new List<ExePatch>();
+            foreach (int i in slots)
+                list.Add(new ExePatch("emptyName" + i, NameTableOffset + i * 4, "30 ED 47 00", "20 10 44 00"));
+            return list.ToArray();
+        }
+
+        static ExePatch[] Concat(ExePatch[] a, ExePatch[] b)
+        {
+            var r = new ExePatch[a.Length + b.Length];
+            a.CopyTo(r, 0); b.CopyTo(r, a.Length);
+            return r;
+        }
+
+        static readonly ExePatch[] Apply = Concat(new[] { TitleColor }, EmptyNamePatches());
         static readonly ExePatch[] Restore = { CommanderTitleOnEnter, CommanderTitleOnReturn };
 
         // 모든 패치를 정해진 상태로 맞춤 (이미 맞으면 건너뜀). 결과 메시지(문제 없으면 null)
@@ -272,15 +257,126 @@ namespace Lang2Launcher
         }
     }
 
+    // ================= 게임 글꼴 =================
+    // 게임은 0x42E293 루프에서 CreateFontA로 글꼴 5개(높이 20/24/32/64/256)를 만들어 모든 글자를 그림.
+    // 원본: 글꼴 "Arial", 문자셋 ANSI(0), 굵기 400, NONANTIALIASED.
+    // Arial엔 한글이 없어서 Windows가 다른 글꼴을 끼워 넣어 그리고, 그게 필터를 거치며 일그러져 보임.
+    // -> 글꼴 이름(8바이트)을 한글 글꼴로, 문자셋을 DEFAULT(1)로, 필요하면 굵기를 700으로.
+    // 크기: 높이 테이블(0x4424F8, int 5개)을 비율로 줄임. 키우는 건 안 됨
+    //       (0x402740이 글자 1바이트당 9px 폭으로 잘라 복사해서 키우면 잘리거나 겹침).
+    class FontOpt { public string Name, Face; public FontOpt(string n, string f) { Name = n; Face = f; } }
+
+    static class FontPatcher
+    {
+        const long FaceOffset = 0x46EEC;      // "Arial\0\0\0" (VA 0x4484EC)
+        const long CharsetOffset = 0x2D6A4;   // push ebx(53, ANSI=0) -> push ebp(55, ebp=1=DEFAULT_CHARSET)
+        const long WeightOffset = 0x2D6A9;    // push 0x190 의 imm32
+        const long HeightOffset = 0x40EF8;    // 글꼴 높이 int[5] (VA 0x4424F8)
+        static readonly int[] OrigHeights = { 20, 24, 32, 64, 256 };
+
+        public static readonly int[] SizePercents = { 100, 95, 90, 85, 80, 75 };
+        public static string SizeName(int pct) { return pct == 100 ? "원본 크기" : pct + "%"; }
+
+        public static readonly FontOpt[] Fonts = {
+            new FontOpt("원본 (Arial)", "Arial"),
+            new FontOpt("굴림", "Gulim"),
+            new FontOpt("돋움", "Dotum"),
+            new FontOpt("바탕", "Batang"),
+        };
+
+        static byte[] Face(string f) { var b = new byte[8]; var a = Encoding.ASCII.GetBytes(f); Array.Copy(a, b, a.Length); return b; }
+
+        // 결과 메시지(문제 없으면 null)
+        public static string Apply(string exe, int font, bool bold, int sizeIdx)
+        {
+            if (font < 0 || font >= Fonts.Length) font = 0;
+            if (sizeIdx < 0 || sizeIdx >= SizePercents.Length) sizeIdx = 0;
+            try
+            {
+                using (var fs = new FileStream(exe, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+                {
+                    var face = Read(fs, FaceOffset, 8);
+                    var cs = Read(fs, CharsetOffset, 1);
+                    var wt = Read(fs, WeightOffset, 4);
+                    bool faceOk = false;
+                    foreach (var f in Fonts) if (Same(face, Face(f.Face))) faceOk = true;
+                    bool csOk = cs != null && (cs[0] == 0x53 || cs[0] == 0x55);
+                    bool wtOk = wt != null && (Same(wt, BitConverter.GetBytes(400)) || Same(wt, BitConverter.GetBytes(700)));
+                    var ht = Read(fs, HeightOffset, OrigHeights.Length * 4);
+                    bool htOk = ht != null;
+                    for (int i = 0; htOk && i < OrigHeights.Length; i++)
+                    {
+                        int h = BitConverter.ToInt32(ht, i * 4);
+                        if (h < OrigHeights[i] / 2 || h > OrigHeights[i]) htOk = false;
+                    }
+                    if (!faceOk || !csOk || !wtOk || !htOk) return "알 수 없는 LANGPC2.EXE 버전이라 글꼴 설정을 건너뛰었어요.";
+
+                    bool orig = font == 0;
+                    Write(fs, FaceOffset, Face(Fonts[font].Face));
+                    Write(fs, CharsetOffset, new byte[] { (byte)(orig ? 0x53 : 0x55) });
+                    Write(fs, WeightOffset, BitConverter.GetBytes(bold ? 700 : 400));
+                    var nh = new byte[OrigHeights.Length * 4];
+                    for (int i = 0; i < OrigHeights.Length; i++)
+                    {
+                        int h = (int)Math.Round(OrigHeights[i] * SizePercents[sizeIdx] / 100.0, MidpointRounding.AwayFromZero);
+                        BitConverter.GetBytes(h).CopyTo(nh, i * 4);
+                    }
+                    Write(fs, HeightOffset, nh);
+                }
+                return null;
+            }
+            catch (UnauthorizedAccessException) { return "LANGPC2.EXE에 쓸 권한이 없어서 글꼴 설정을 적용하지 못했어요."; }
+            catch (IOException ex) { return "글꼴 설정 실패: " + ex.Message; }
+        }
+
+        static byte[] Read(FileStream fs, long off, int n)
+        {
+            if (fs.Length < off + n) return null;
+            var buf = new byte[n];
+            fs.Seek(off, SeekOrigin.Begin);
+            int read = 0;
+            while (read < n) { int r = fs.Read(buf, read, n - read); if (r <= 0) return null; read += r; }
+            return buf;
+        }
+
+        static void Write(FileStream fs, long off, byte[] b)
+        {
+            var cur = Read(fs, off, b.Length);
+            if (cur != null && Same(cur, b)) return;
+            fs.Seek(off, SeekOrigin.Begin);
+            fs.Write(b, 0, b.Length);
+        }
+
+        static bool Same(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+    }
+
     // ================= 효과음(DSF) 음량 균형 =================
     // DSF 형식: [0]데이터 크기 [4]? [8]? [0x0C]? [0x10]WAVEFORMAT(PCM, 모노, 16비트) [0x20]"da" [0x22~]PCM
-    // RECORD49~95 등 나중에 추가된 효과음이 다른 효과음보다 약 2배(6~8dB) 크게 녹음돼 있어서,
-    // 원본 피크가 LoudPeak를 넘는 파일만 Gain(-6dB)을 곱해 낮춤.
+    // 1) RECORD49~95 등 나중에 추가된 효과음이 다른 효과음보다 약 2배(6~8dB) 크게 녹음돼 있어서,
+    //    원본 피크가 LoudPeak를 넘는 파일을 Gain(-6dB)으로 낮춤.
+    // 2) 맵 마법(스킬) 연출 효과음(효과음 슬롯 7,8,9,12,13,17,18,23,24,25)도 체감상 커서 같이 낮춤.
     static class SoundFix
     {
         const int HeaderSize = 0x22;
         const int LoudPeak = 16000;     // 기존 효과음 최대 피크 약 13,500 / 큰 효과음 최소 약 17,600
         const double Gain = 0.5;        // -6dB
+
+        // 맵 마법(스킬) 연출 효과음
+        static readonly string[] SkillSounds = {
+            "RECORD14.DSF", "RECORD16.DSF", "RECORD18.DSF", "RECORD24.DSF", "RECORD26.DSF",
+            "RECORD34.DSF", "RECORD36.DSF", "RECORD46.DSF", "RECORD48.DSF", "RECORD50.DSF"
+        };
+
+        static bool IsSkillSound(string name)
+        {
+            foreach (var n in SkillSounds) if (string.Equals(n, name, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
 
         public static string Apply(string gameDir)
         {
@@ -298,7 +394,8 @@ namespace Lang2Launcher
                 foreach (var b in Directory.GetFiles(orig, "*.DSF"))
                 {
                     byte[] src = File.ReadAllBytes(b);
-                    if (!IsPcm16(src) || Peak(src) <= LoudPeak) continue;
+                    if (!IsPcm16(src)) continue;
+                    if (Peak(src) <= LoudPeak && !IsSkillSound(Path.GetFileName(b))) continue;
                     byte[] want = Scale(src, Gain);
                     string f = Path.Combine(dir, Path.GetFileName(b));
                     byte[] cur = File.Exists(f) ? File.ReadAllBytes(f) : null;
@@ -378,9 +475,9 @@ namespace Lang2Launcher
 
         Label lblVol, lblStatus, lblScrNote;
         TrackBar track;
-        ComboBox cmbMode, cmbSize, cmbFilter;
+        ComboBox cmbMode, cmbSize, cmbFilter, cmbFont, cmbFontSize;
         NumericUpDown numW, numH;
-        CheckBox chkAspect, chkBoxing, chkVsync, chkResize, chkClose;
+        CheckBox chkAspect, chkBoxing, chkVsync, chkResize, chkClose, chkBold;
         Button btn;
         Timer timer;
 
@@ -394,7 +491,7 @@ namespace Lang2Launcher
             AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
             Text = "랑그릿사2 런처";
-            ClientSize = new Size(400, 470);
+            ClientSize = new Size(400, 538);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
@@ -404,7 +501,7 @@ namespace Lang2Launcher
             BuildUi();
 
             // 런처 설정
-            int vol = 30; bool closeOnExit = true;
+            int vol = 30; bool closeOnExit = true; int font = 0; bool bold = false; int fontSize = 0;
             if (File.Exists(cfgPath))
             {
                 foreach (var line in File.ReadAllLines(cfgPath))
@@ -413,14 +510,23 @@ namespace Lang2Launcher
                     if (m.Success) vol = Math.Min(100, int.Parse(m.Groups[1].Value));
                     m = Regex.Match(line, @"^\s*closeOnExit\s*=\s*(\w+)");
                     if (m.Success) closeOnExit = m.Groups[1].Value.Equals("true", StringComparison.OrdinalIgnoreCase);
+                    m = Regex.Match(line, @"^\s*font\s*=\s*(\d+)");
+                    if (m.Success) font = Math.Min(FontPatcher.Fonts.Length - 1, int.Parse(m.Groups[1].Value));
+                    m = Regex.Match(line, @"^\s*fontBold\s*=\s*(\w+)");
+                    if (m.Success) bold = m.Groups[1].Value.Equals("true", StringComparison.OrdinalIgnoreCase);
+                    m = Regex.Match(line, @"^\s*fontSize\s*=\s*(\d+)");
+                    if (m.Success) fontSize = Math.Min(FontPatcher.SizePercents.Length - 1, int.Parse(m.Groups[1].Value));
                 }
             }
             track.Value = vol;
             chkClose.Checked = closeOnExit;
+            cmbFont.SelectedIndex = font;
+            chkBold.Checked = bold;
+            cmbFontSize.SelectedIndex = fontSize;
 
             foreach (var p in Process.GetProcessesByName("LANGPC2")) { game = p; break; }
 
-            try { LoadScreen(); } catch (IOException) { }
+            LoadScreen();
             loading = false;
             UpdateUi();
 
@@ -443,7 +549,7 @@ namespace Lang2Launcher
             track = Add<TrackBar>(grpSnd, 6, 42, 362, 45);
             track.Minimum = 0; track.Maximum = 100; track.TickFrequency = 10; track.LargeChange = 10;
 
-            var grpScr = Add<GroupBox>(this, 12, 106, 376, 252); grpScr.Text = "화면 (cnc-ddraw)";
+            var grpScr = Add<GroupBox>(this, 12, 106, 376, 320); grpScr.Text = "화면";
             Add<Label>(grpScr, 12, 26, 90, 20).Text = "표시 모드";
             cmbMode = Add<ComboBox>(grpScr, 110, 22, 250, 24); cmbMode.DropDownStyle = ComboBoxStyle.DropDownList;
             cmbMode.Items.AddRange(modes);
@@ -466,17 +572,29 @@ namespace Lang2Launcher
             chkVsync = Add<CheckBox>(grpScr, 12, 182, 175, 24); chkVsync.Text = "수직동기";
             chkResize = Add<CheckBox>(grpScr, 190, 182, 175, 24); chkResize.Text = "창 크기 직접 조절";
 
-            lblScrNote = Add<Label>(grpScr, 12, 214, 350, 30);
+            Add<Label>(grpScr, 12, 216, 90, 20).Text = "게임 글꼴";
+            cmbFont = Add<ComboBox>(grpScr, 110, 212, 150, 24); cmbFont.DropDownStyle = ComboBoxStyle.DropDownList;
+            foreach (var f in FontPatcher.Fonts) cmbFont.Items.Add(f.Name);
+            chkBold = Add<CheckBox>(grpScr, 272, 212, 90, 24); chkBold.Text = "굵게";
+
+            Add<Label>(grpScr, 12, 250, 90, 20).Text = "글자 크기";
+            cmbFontSize = Add<ComboBox>(grpScr, 110, 246, 150, 24); cmbFontSize.DropDownStyle = ComboBoxStyle.DropDownList;
+            foreach (var p in FontPatcher.SizePercents) cmbFontSize.Items.Add(FontPatcher.SizeName(p));
+
+            lblScrNote = Add<Label>(grpScr, 12, 282, 350, 30);
             lblScrNote.ForeColor = Color.DimGray;
             lblScrNote.Text = "화면 설정은 게임을 다음에 시작할 때 적용돼요.";
 
-            chkClose = Add<CheckBox>(this, 16, 366, 360, 24); chkClose.Text = "게임 종료 시 런처도 닫기";
-            btn = Add<Button>(this, 16, 394, 368, 38); btn.Text = "게임 시작";
+            chkClose = Add<CheckBox>(this, 16, 434, 360, 24); chkClose.Text = "게임 종료 시 런처도 닫기";
+            btn = Add<Button>(this, 16, 462, 368, 38); btn.Text = "게임 시작";
             AcceptButton = btn;
-            lblStatus = Add<Label>(this, 16, 440, 368, 22); lblStatus.ForeColor = Color.DimGray;
+            lblStatus = Add<Label>(this, 16, 508, 368, 22); lblStatus.ForeColor = Color.DimGray;
 
             track.ValueChanged += delegate { needApply = true; UpdateUi(); SaveConfig(); };
             chkClose.CheckedChanged += delegate { SaveConfig(); };
+            cmbFont.SelectedIndexChanged += delegate { SaveConfig(); };
+            chkBold.CheckedChanged += delegate { SaveConfig(); };
+            cmbFontSize.SelectedIndexChanged += delegate { SaveConfig(); };
             cmbMode.SelectedIndexChanged += delegate { UpdateUi(); SaveScreen(); };
             cmbSize.SelectedIndexChanged += delegate
             {
@@ -496,7 +614,8 @@ namespace Lang2Launcher
         void SaveConfig()
         {
             if (loading) return;
-            try { File.WriteAllText(cfgPath, "volume=" + track.Value + "\r\ncloseOnExit=" + B(chkClose.Checked) + "\r\n", Encoding.ASCII); } catch { }
+            try { File.WriteAllText(cfgPath, "volume=" + track.Value + "\r\ncloseOnExit=" + B(chkClose.Checked)
+                + "\r\nfont=" + Math.Max(0, cmbFont.SelectedIndex) + "\r\nfontBold=" + B(chkBold.Checked) + "\r\nfontSize=" + Math.Max(0, cmbFontSize.SelectedIndex) + "\r\n", Encoding.ASCII); } catch { }
         }
 
         void LoadScreen()
@@ -554,8 +673,6 @@ namespace Lang2Launcher
             catch (Exception ex) { lblScrNote.Text = "ddraw.ini 저장 실패: " + ex.Message; }
         }
 
-        int reloadTries;
-
         bool Running { get { return game != null && !game.HasExited; } }
 
         void UpdateUi()
@@ -581,8 +698,9 @@ namespace Lang2Launcher
             }
             SaveConfig(); SaveScreen();
             string exeMsg = GamePatcher.ApplyAll(exePath);
+            string fontMsg = FontPatcher.Apply(exePath, cmbFont.SelectedIndex, chkBold.Checked, cmbFontSize.SelectedIndex);
             string sndMsg = SoundFix.Apply(gameDir);
-            patchMsg = exeMsg ?? sndMsg;
+            patchMsg = exeMsg ?? fontMsg ?? sndMsg;
             try
             {
                 game = Process.Start(new ProcessStartInfo(exePath) { WorkingDirectory = gameDir, UseShellExecute = false });
@@ -601,17 +719,9 @@ namespace Lang2Launcher
             if (game == null) return;
             if (game.HasExited)
             {
-                // cnc-ddraw가 종료 시 창 크기/위치를 저장하므로 다시 읽어옴.
-                // 종료 직후엔 ddraw.ini가 잠깐 잠겨 있을 수 있어 실패하면 다음 틱에 재시도 (최대 약 3초)
-                bool ok = false;
-                loading = true;
-                try { LoadScreen(); ok = true; }
-                catch (IOException) { }
-                catch (UnauthorizedAccessException) { }
-                finally { loading = false; }
-                if (!ok && ++reloadTries < 10) return;
-                reloadTries = 0;
                 game = null;
+                // cnc-ddraw가 종료 시 창 크기/위치를 저장하므로 다시 읽어옴
+                loading = true; LoadScreen(); loading = false;
                 UpdateUi();
                 if (chkClose.Checked) Close();
                 return;
