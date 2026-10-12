@@ -2,6 +2,7 @@
 // .NET Framework 4.x 기본 컴파일러(csc, C# 5)로 빌드됩니다. 빌드 방법은 README 참고.
 // - 소리: 이 게임 볼륨만 조절 (실행 중에도 실시간 반영)
 // - 화면: cnc-ddraw(ddraw.ini [ddraw] 섹션) 주요 설정 편집 (다음 실행부터 적용)
+// - 게임 패치: 게임 시작 직전에 LANGPC2.EXE 버그 수정 바이트 패치를 자동 적용
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -130,6 +131,111 @@ namespace Lang2Launcher
         }
     }
 
+    // ================= LANGPC2.EXE 바이트 패치 =================
+    class ExePatch
+    {
+        public readonly string Key;
+        public readonly long Offset;           // 파일 오프셋
+        public readonly byte[] Orig, Patched;
+        public ExePatch(string key, long offset, string orig, string patched)
+        {
+            Key = key; Offset = offset; Orig = Hex(orig); Patched = Hex(patched);
+        }
+        static byte[] Hex(string h)
+        {
+            h = h.Replace(" ", "");
+            var b = new byte[h.Length / 2];
+            for (int i = 0; i < b.Length; i++) b[i] = Convert.ToByte(h.Substring(i * 2, 2), 16);
+            return b;
+        }
+    }
+
+    static class GamePatcher
+    {
+        // 창 제목(병사배속/아이템장비/지휘관배치 등) 글자색 수정 - 0x42275A
+        // 원본이 SetTextColor(dc, -1)(=CLR_INVALID)을 써서 Windows NT 계열에서 글자색이 안 바뀌어
+        // 그림자색(거의 검정)으로 찍히는 바람에 제목이 안 보임 -> 흰색(0x00FFFFFF)으로.
+        //   원본: mov edx,[esp+c] / push 1 / push edx / call edi / mov eax,[esp+c] / push -1 / push eax / call ebx
+        //   수정: mov eax,[esp+c] / push 0xFFFFFF / push eax / push 1 / push eax / call edi / call ebx / nop
+        public static readonly ExePatch TitleColor = new ExePatch("titleFix", 0x21B5A,
+            "8B 54 24 0C 6A 01 52 FF D7 8B 44 24 0C 6A FF 50 FF D3",
+            "8B 44 24 0C 68 FF FF FF 00 50 6A 01 50 FF D7 FF D3 90");
+
+        // 하위 메뉴(병사배속/아이템장비 등)에서 캠프 화면으로 돌아올 때 지휘관 목록 창을 다시 만들면서
+        // '지휘관' 제목을 또 찍는 호출 숨기기 - 0x42B003 (call 0x405B80 -> nop)
+        public static readonly ExePatch HideCommanderTitleOnReturn = new ExePatch("hideCommanderTitleOnReturn", 0x2A403,
+            "E8 78 AB FD FF",
+            "90 90 90 90 90");
+
+        // 캠프 화면에 처음 들어올 때의 '지휘관' 제목 - 0x42ABCD. 이전 버전 런처가 nop 처리했던 것을 원래대로 되돌림
+        public static readonly ExePatch CommanderTitleOnEnter = new ExePatch("commanderTitleOnEnter", 0x29FCD,
+            "E8 AE AF FD FF",
+            "90 90 90 90 90");
+
+        // 적용할 패치 / 원본으로 되돌릴 패치
+        static readonly ExePatch[] Apply = { TitleColor, HideCommanderTitleOnReturn };
+        static readonly ExePatch[] Restore = { CommanderTitleOnEnter };
+
+        // 모든 패치를 정해진 상태로 맞춤 (이미 맞으면 건너뜀). 결과 메시지(문제 없으면 null)
+        public static string ApplyAll(string exe)
+        {
+            var list = new ExePatch[Apply.Length + Restore.Length];
+            var want = new bool[list.Length];
+            for (int i = 0; i < Apply.Length; i++) { list[i] = Apply[i]; want[i] = true; }
+            for (int i = 0; i < Restore.Length; i++) { list[Apply.Length + i] = Restore[i]; want[Apply.Length + i] = false; }
+            return Sync(exe, list, want);
+        }
+
+        // 각 패치를 원하는 상태(true=적용, false=원본)로 맞춤. 결과 메시지(문제 없으면 null)
+        public static string Sync(string exe, ExePatch[] patches, bool[] want)
+        {
+            try
+            {
+                using (var fs = new FileStream(exe, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    for (int i = 0; i < patches.Length; i++)
+                        if (State(fs, patches[i]) < 0) return "알 수 없는 LANGPC2.EXE 버전이라 게임 패치를 건너뛰었어요.";
+                }
+                using (var fs = new FileStream(exe, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+                {
+                    for (int i = 0; i < patches.Length; i++)
+                    {
+                        int st = State(fs, patches[i]);
+                        bool on = st == 1;
+                        if (on == want[i]) continue;
+                        var bytes = want[i] ? patches[i].Patched : patches[i].Orig;
+                        fs.Seek(patches[i].Offset, SeekOrigin.Begin);
+                        fs.Write(bytes, 0, bytes.Length);
+                    }
+                }
+                return null;
+            }
+            catch (UnauthorizedAccessException) { return "LANGPC2.EXE에 쓸 권한이 없어서 게임 패치를 적용하지 못했어요."; }
+            catch (IOException ex) { return "게임 패치 실패: " + ex.Message; }
+        }
+
+        // 1 = 패치됨, 0 = 원본, -1 = 알 수 없음
+        static int State(FileStream fs, ExePatch p)
+        {
+            int n = p.Orig.Length;
+            if (fs.Length < p.Offset + n) return -1;
+            var buf = new byte[n];
+            fs.Seek(p.Offset, SeekOrigin.Begin);
+            int read = 0;
+            while (read < n) { int r = fs.Read(buf, read, n - read); if (r <= 0) return -1; read += r; }
+            if (Same(buf, p.Patched)) return 1;
+            if (Same(buf, p.Orig)) return 0;
+            return -1;
+        }
+
+        static bool Same(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+    }
+
     class SizeOpt { public string Name; public int W, H; public SizeOpt(string n, int w, int h) { Name = n; W = w; H = h; } }
     class FilterOpt { public string Name, Shader, Renderer; public int D3d; public FilterOpt(string n, string s, int d, string r) { Name = n; Shader = s; D3d = d; Renderer = r; } }
 
@@ -153,6 +259,7 @@ namespace Lang2Launcher
 
         Process game;
         bool needApply = true, loading = true, loadingSize = false;
+        string patchMsg;
 
         Label lblVol, lblStatus, lblScrNote;
         TrackBar track;
@@ -343,7 +450,9 @@ namespace Lang2Launcher
             numW.Enabled = custom; numH.Enabled = custom;
             chkResize.Enabled = isWin;
             btn.Enabled = !Running;
-            lblStatus.Text = Running ? "실행 중 - 볼륨은 바로 조절돼요" : "대기 중";
+            if (patchMsg != null) lblStatus.Text = patchMsg;
+            else if (Running) lblStatus.Text = "실행 중 - 볼륨은 바로 조절돼요";
+            else lblStatus.Text = "대기 중";
         }
 
         void StartGame()
@@ -354,6 +463,7 @@ namespace Lang2Launcher
                 return;
             }
             SaveConfig(); SaveScreen();
+            patchMsg = GamePatcher.ApplyAll(exePath);
             try
             {
                 game = Process.Start(new ProcessStartInfo(exePath) { WorkingDirectory = gameDir, UseShellExecute = false });
