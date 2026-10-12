@@ -360,21 +360,25 @@ namespace Lang2Launcher
     // 1) RECORD49~95 등 나중에 추가된 효과음이 다른 효과음보다 약 2배(6~8dB) 크게 녹음돼 있어서,
     //    원본 피크가 LoudPeak를 넘는 파일을 Gain(-6dB)으로 낮춤.
     // 2) 맵 마법(스킬) 연출 효과음(효과음 슬롯 7,8,9,12,13,17,18,23,24,25)도 체감상 커서 같이 낮춤.
+    // 3) 어택 마법 효과음 RECORD17(5개 동시 재생), RECORD25(4개씩 3번 겹쳐 재생)도 체감이 커서 같이 낮춤. (SoundLog로 확인)
+    // 4) 목록에서 빠진 파일이 예전 런처 결과물로 남아 있으면 원본으로 되돌림.
     static class SoundFix
     {
         const int HeaderSize = 0x22;
         const int LoudPeak = 16000;     // 기존 효과음 최대 피크 약 13,500 / 큰 효과음 최소 약 17,600
         const double Gain = 0.5;        // -6dB
+        static readonly double[] OldGains = { 0.5, 0.25, 1.0 / 3 };   // 런처가 썼던 배율 (되돌리기 판별용)
 
         // 맵 마법(스킬) 연출 효과음
         static readonly string[] SkillSounds = {
             "RECORD14.DSF", "RECORD16.DSF", "RECORD18.DSF", "RECORD24.DSF", "RECORD26.DSF",
-            "RECORD34.DSF", "RECORD36.DSF", "RECORD46.DSF", "RECORD48.DSF", "RECORD50.DSF"
+            "RECORD34.DSF", "RECORD36.DSF", "RECORD46.DSF", "RECORD48.DSF", "RECORD50.DSF",
+            "RECORD17.DSF", "RECORD25.DSF"   // 어택 마법 (겹쳐 재생됨)
         };
 
-        static bool IsSkillSound(string name)
+        static bool InList(string[] list, string name)
         {
-            foreach (var n in SkillSounds) if (string.Equals(n, name, StringComparison.OrdinalIgnoreCase)) return true;
+            foreach (var n in list) if (string.Equals(n, name, StringComparison.OrdinalIgnoreCase)) return true;
             return false;
         }
 
@@ -395,18 +399,26 @@ namespace Lang2Launcher
                 {
                     byte[] src = File.ReadAllBytes(b);
                     if (!IsPcm16(src)) continue;
-                    if (Peak(src) <= LoudPeak && !IsSkillSound(Path.GetFileName(b))) continue;
-                    byte[] want = Scale(src, Gain);
-                    string f = Path.Combine(dir, Path.GetFileName(b));
+                    string name = Path.GetFileName(b);
+                    bool lower = Peak(src) > LoudPeak || InList(SkillSounds, name);
+                    byte[] want = lower ? Scale(src, Gain) : src;
+                    string f = Path.Combine(dir, name);
                     byte[] cur = File.Exists(f) ? File.ReadAllBytes(f) : null;
-                    if (cur != null && Same(cur, want)) continue;          // 이미 적용됨
-                    if (cur != null && !Same(cur, src)) continue;          // 사용자가 바꾼 파일은 건드리지 않음
+                    if (cur != null && Same(cur, want)) continue;          // 이미 원하는 상태
+                    // 원본이거나 런처가 만든 결과물일 때만 덮어씀. 사용자가 바꾼 파일은 건드리지 않음
+                    if (cur != null && !Same(cur, src) && !IsLauncherOutput(cur, src)) continue;
                     File.WriteAllBytes(f, want);
                 }
                 return null;
             }
             catch (UnauthorizedAccessException) { return "DSF 폴더에 쓸 권한이 없어서 효과음 음량을 조정하지 못했어요."; }
             catch (IOException ex) { return "효과음 음량 조정 실패: " + ex.Message; }
+        }
+
+        static bool IsLauncherOutput(byte[] cur, byte[] src)
+        {
+            foreach (var g in OldGains) if (Same(cur, Scale(src, g))) return true;
+            return false;
         }
 
         static bool IsPcm16(byte[] d)
