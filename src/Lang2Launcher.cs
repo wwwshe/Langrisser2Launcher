@@ -3,6 +3,7 @@
 // - 소리: 이 게임 볼륨만 조절 (실행 중에도 실시간 반영)
 // - 화면: cnc-ddraw(ddraw.ini [ddraw] 섹션) 주요 설정 편집 (다음 실행부터 적용)
 // - 게임 패치: 게임 시작 직전에 LANGPC2.EXE 버그 수정 바이트 패치를 자동 적용
+// - 효과음 균형: 유독 크게 녹음된 효과음(DSF)만 음량을 낮춤 (원본은 DSF_ORIG에 백업)
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -88,12 +89,50 @@ namespace Lang2Launcher
     // ================= ddraw.ini [ddraw] 섹션 읽기/쓰기 =================
     static class DdrawIni
     {
+        // 게임(cnc-ddraw)이 종료 직후 ddraw.ini를 쓰는 중이거나 백신이 스캔 중이면 잠깐 잠길 수 있음
+        // → 공유 모드로 열고 짧게 재시도
+        static string[] ReadLinesShared(string path)
+        {
+            for (int attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                    using (var sr = new StreamReader(fs, new UTF8Encoding(false), true))
+                    {
+                        var list = new List<string>();
+                        string line;
+                        while ((line = sr.ReadLine()) != null) list.Add(line);
+                        return list.ToArray();
+                    }
+                }
+                catch (IOException)
+                {
+                    if (attempt >= 4) throw;
+                    System.Threading.Thread.Sleep(50);
+                }
+            }
+        }
+
+        static void WriteLinesRetry(string path, string[] lines)
+        {
+            for (int attempt = 0; ; attempt++)
+            {
+                try { File.WriteAllLines(path, lines, new UTF8Encoding(false)); return; }
+                catch (IOException)
+                {
+                    if (attempt >= 9) throw;
+                    System.Threading.Thread.Sleep(100);
+                }
+            }
+        }
+
         public static Dictionary<string, string> Read(string path)
         {
             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (!File.Exists(path)) return map;
             bool inSec = false;
-            foreach (var raw in File.ReadAllLines(path))
+            foreach (var raw in ReadLinesShared(path))
             {
                 var t = raw.Trim();
                 var m = Regex.Match(t, @"^\[(.+)\]$");
@@ -107,7 +146,7 @@ namespace Lang2Launcher
 
         public static void Write(string path, Dictionary<string, string> values)
         {
-            var lines = File.Exists(path) ? new List<string>(File.ReadAllLines(path)) : new List<string> { "[ddraw]" };
+            var lines = File.Exists(path) ? new List<string>(ReadLinesShared(path)) : new List<string> { "[ddraw]" };
             int secStart = -1, secEnd = lines.Count;
             for (int i = 0; i < lines.Count; i++)
             {
@@ -127,7 +166,7 @@ namespace Lang2Launcher
                 }
                 if (!done) { lines.Insert(secStart + 1, kv.Key + "=" + kv.Value); secEnd++; }
             }
-            File.WriteAllLines(path, lines.ToArray());
+            WriteLinesRetry(path, lines.ToArray());
         }
     }
 
@@ -233,6 +272,85 @@ namespace Lang2Launcher
         }
     }
 
+    // ================= 효과음(DSF) 음량 균형 =================
+    // DSF 형식: [0]데이터 크기 [4]? [8]? [0x0C]? [0x10]WAVEFORMAT(PCM, 모노, 16비트) [0x20]"da" [0x22~]PCM
+    // RECORD49~95 등 나중에 추가된 효과음이 다른 효과음보다 약 2배(6~8dB) 크게 녹음돼 있어서,
+    // 원본 피크가 LoudPeak를 넘는 파일만 Gain(-6dB)을 곱해 낮춤.
+    static class SoundFix
+    {
+        const int HeaderSize = 0x22;
+        const int LoudPeak = 16000;     // 기존 효과음 최대 피크 약 13,500 / 큰 효과음 최소 약 17,600
+        const double Gain = 0.5;        // -6dB
+
+        public static string Apply(string gameDir)
+        {
+            string dir = Path.Combine(gameDir, "DSF");
+            string orig = Path.Combine(gameDir, "DSF_ORIG");
+            if (!Directory.Exists(dir)) return null;
+            try
+            {
+                if (!Directory.Exists(orig)) Directory.CreateDirectory(orig);
+                foreach (var f in Directory.GetFiles(dir, "*.DSF"))
+                {
+                    string b = Path.Combine(orig, Path.GetFileName(f));
+                    if (!File.Exists(b)) File.Copy(f, b);
+                }
+                foreach (var b in Directory.GetFiles(orig, "*.DSF"))
+                {
+                    byte[] src = File.ReadAllBytes(b);
+                    if (!IsPcm16(src) || Peak(src) <= LoudPeak) continue;
+                    byte[] want = Scale(src, Gain);
+                    string f = Path.Combine(dir, Path.GetFileName(b));
+                    byte[] cur = File.Exists(f) ? File.ReadAllBytes(f) : null;
+                    if (cur != null && Same(cur, want)) continue;          // 이미 적용됨
+                    if (cur != null && !Same(cur, src)) continue;          // 사용자가 바꾼 파일은 건드리지 않음
+                    File.WriteAllBytes(f, want);
+                }
+                return null;
+            }
+            catch (UnauthorizedAccessException) { return "DSF 폴더에 쓸 권한이 없어서 효과음 음량을 조정하지 못했어요."; }
+            catch (IOException ex) { return "효과음 음량 조정 실패: " + ex.Message; }
+        }
+
+        static bool IsPcm16(byte[] d)
+        {
+            if (d.Length < HeaderSize) return false;
+            int size = BitConverter.ToInt32(d, 0);
+            int tag = BitConverter.ToUInt16(d, 0x10), ch = BitConverter.ToUInt16(d, 0x12), bits = BitConverter.ToUInt16(d, 0x1E);
+            return size == d.Length - HeaderSize && tag == 1 && ch == 1 && bits == 16;
+        }
+
+        static int Peak(byte[] d)
+        {
+            int peak = 0;
+            for (int i = HeaderSize; i + 1 < d.Length; i += 2)
+            {
+                int v = Math.Abs((int)BitConverter.ToInt16(d, i));
+                if (v > peak) peak = v;
+            }
+            return peak;
+        }
+
+        static byte[] Scale(byte[] d, double gain)
+        {
+            var o = (byte[])d.Clone();
+            for (int i = HeaderSize; i + 1 < o.Length; i += 2)
+            {
+                int v = (int)Math.Round(BitConverter.ToInt16(o, i) * gain, MidpointRounding.AwayFromZero);
+                if (v > short.MaxValue) v = short.MaxValue; else if (v < short.MinValue) v = short.MinValue;
+                o[i] = (byte)(v & 0xFF); o[i + 1] = (byte)((v >> 8) & 0xFF);
+            }
+            return o;
+        }
+
+        static bool Same(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+    }
+
     class SizeOpt { public string Name; public int W, H; public SizeOpt(string n, int w, int h) { Name = n; W = w; H = h; } }
     class FilterOpt { public string Name, Shader, Renderer; public int D3d; public FilterOpt(string n, string s, int d, string r) { Name = n; Shader = s; D3d = d; Renderer = r; } }
 
@@ -302,7 +420,7 @@ namespace Lang2Launcher
 
             foreach (var p in Process.GetProcessesByName("LANGPC2")) { game = p; break; }
 
-            LoadScreen();
+            try { LoadScreen(); } catch (IOException) { }
             loading = false;
             UpdateUi();
 
@@ -436,6 +554,8 @@ namespace Lang2Launcher
             catch (Exception ex) { lblScrNote.Text = "ddraw.ini 저장 실패: " + ex.Message; }
         }
 
+        int reloadTries;
+
         bool Running { get { return game != null && !game.HasExited; } }
 
         void UpdateUi()
@@ -460,7 +580,9 @@ namespace Lang2Launcher
                 return;
             }
             SaveConfig(); SaveScreen();
-            patchMsg = GamePatcher.ApplyAll(exePath);
+            string exeMsg = GamePatcher.ApplyAll(exePath);
+            string sndMsg = SoundFix.Apply(gameDir);
+            patchMsg = exeMsg ?? sndMsg;
             try
             {
                 game = Process.Start(new ProcessStartInfo(exePath) { WorkingDirectory = gameDir, UseShellExecute = false });
@@ -479,9 +601,17 @@ namespace Lang2Launcher
             if (game == null) return;
             if (game.HasExited)
             {
+                // cnc-ddraw가 종료 시 창 크기/위치를 저장하므로 다시 읽어옴.
+                // 종료 직후엔 ddraw.ini가 잠깐 잠겨 있을 수 있어 실패하면 다음 틱에 재시도 (최대 약 3초)
+                bool ok = false;
+                loading = true;
+                try { LoadScreen(); ok = true; }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+                finally { loading = false; }
+                if (!ok && ++reloadTries < 10) return;
+                reloadTries = 0;
                 game = null;
-                // cnc-ddraw가 종료 시 창 크기/위치를 저장하므로 다시 읽어옴
-                loading = true; LoadScreen(); loading = false;
                 UpdateUi();
                 if (chkClose.Checked) Close();
                 return;
