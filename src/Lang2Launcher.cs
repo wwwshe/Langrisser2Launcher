@@ -161,20 +161,17 @@ namespace Lang2Launcher
             "8B 54 24 0C 6A 01 52 FF D7 8B 44 24 0C 6A FF 50 FF D3",
             "8B 44 24 0C 68 FF FF FF 00 50 6A 01 50 FF D7 FF D3 90");
 
-        // 하위 메뉴(병사배속/아이템장비 등)에서 캠프 화면으로 돌아올 때 지휘관 목록 창을 다시 만들면서
-        // '지휘관' 제목을 또 찍는 호출 숨기기 - 0x42B003 (call 0x405B80 -> nop)
-        public static readonly ExePatch HideCommanderTitleOnReturn = new ExePatch("hideCommanderTitleOnReturn", 0x2A403,
-            "E8 78 AB FD FF",
-            "90 90 90 90 90");
-
-        // 캠프 화면에 처음 들어올 때의 '지휘관' 제목 - 0x42ABCD. 이전 버전 런처가 nop 처리했던 것을 원래대로 되돌림
+        // 이전 개발 버전이 캠프 화면 '지휘관' 제목 호출(0x42ABCD, 0x42B003)을 nop 처리했던 것을 원래대로 되돌림
         public static readonly ExePatch CommanderTitleOnEnter = new ExePatch("commanderTitleOnEnter", 0x29FCD,
             "E8 AE AF FD FF",
             "90 90 90 90 90");
+        public static readonly ExePatch CommanderTitleOnReturn = new ExePatch("commanderTitleOnReturn", 0x2A403,
+            "E8 78 AB FD FF",
+            "90 90 90 90 90");
 
         // 적용할 패치 / 원본으로 되돌릴 패치
-        static readonly ExePatch[] Apply = { TitleColor, HideCommanderTitleOnReturn };
-        static readonly ExePatch[] Restore = { CommanderTitleOnEnter };
+        static readonly ExePatch[] Apply = { TitleColor };
+        static readonly ExePatch[] Restore = { CommanderTitleOnEnter, CommanderTitleOnReturn };
 
         // 모든 패치를 정해진 상태로 맞춤 (이미 맞으면 건너뜀). 결과 메시지(문제 없으면 null)
         public static string ApplyAll(string exe)
