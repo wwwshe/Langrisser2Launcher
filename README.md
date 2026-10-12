@@ -4,6 +4,10 @@
 
 게임 볼륨 조절, [cnc-ddraw](https://github.com/FunkyFr3sh/cnc-ddraw) 화면 설정, Windows 10/11용 게임 버그 수정을 창 하나에서 할 수 있어요.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="Lang2Launcher 실행 화면" width="400">
+</p>
+
 > ⚠️ 이 저장소에는 **게임 파일이 포함되어 있지 않아요.** 게임은 직접 소유한 정품에서 준비해 주세요.
 
 ---
